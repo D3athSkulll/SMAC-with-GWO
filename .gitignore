@@ -1,0 +1,14 @@
+# MATLAB
+*.asv
+*.autosave
+*.mex*
+slprj/
+codegen/
+
+# Generated results
+results/
+*.log
+
+# OS / editor
+.DS_Store
+.vscode/
