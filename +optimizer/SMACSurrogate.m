@@ -44,6 +44,8 @@ classdef SMACSurrogate < handle
         BestObserved = Inf  % lowest fitness ever added (survives trimming)
         Model               % fitted RegressionGP object
         NumFits = 0         % how many times the GP was refitted
+        TargetMean = 0      % fitness mean used to standardise GP targets
+        TargetScale = 1     % fitness std used to standardise GP targets
     end
 
     methods
@@ -104,8 +106,9 @@ classdef SMACSurrogate < handle
             %PREDICTFITNESS  GP predictive mean and standard deviation.
             assert(obj.isReady(), 'SMACSurrogate:notReady', ...
                 'Surrogate needs at least %d observations before predicting.', obj.MinTrainingSize);
-            [mu, sigma] = predict(obj.Model, obj.scaleInputs(positions));
-            sigma = max(sigma, eps);   % avoid division by zero in EI
+            [mu_std, sigma_std] = predict(obj.Model, obj.scaleInputs(positions));
+            mu = obj.TargetMean + obj.TargetScale * mu_std;     % back to fitness units
+            sigma = max(obj.TargetScale * sigma_std, eps);      % avoid division by zero in EI
         end
 
         function score = acquisitionScore(obj, mu, sigma)
@@ -153,11 +156,33 @@ classdef SMACSurrogate < handle
     methods (Access = private)
         function fit(obj)
             %FIT  Fit the GP; kernel hyper-parameters and noise by marginal likelihood.
-            obj.Model = fitrgp(obj.TrainInputs, obj.TrainTargets, ...
-                'KernelFunction', 'matern52', ...
-                'BasisFunction', 'constant', ...
-                'Standardize', false, ...       % inputs are already scaled to [0,1]
-                'SigmaLowerBound', 1e-4);       % small noise floor keeps the fit stable
+            %   Targets are z-scored so the noise floor is relative to the
+            %   fitness spread. Smooth noise-free data can still make the
+            %   kernel matrix singular, so the fit is retried with a larger
+            %   noise floor if the Cholesky factorisation fails.
+            obj.TargetMean = mean(obj.TrainTargets);
+            obj.TargetScale = std(obj.TrainTargets);
+            if ~(obj.TargetScale > 0)
+                obj.TargetScale = 1;            % all targets equal: avoid dividing by 0
+            end
+            targets_std = (obj.TrainTargets - obj.TargetMean) / obj.TargetScale;
+
+            noise_floors = [1e-3 1e-2 1e-1];
+            for k = 1:numel(noise_floors)
+                try
+                    obj.Model = fitrgp(obj.TrainInputs, targets_std, ...
+                        'KernelFunction', 'matern52', ...
+                        'BasisFunction', 'constant', ...
+                        'Standardize', false, ...       % inputs are already scaled to [0,1]
+                        'Sigma', max(0.1, 2 * noise_floors(k)), ...
+                        'SigmaLowerBound', noise_floors(k));
+                    break;
+                catch err
+                    if k == numel(noise_floors)
+                        rethrow(err);
+                    end
+                end
+            end
             obj.NumFits = obj.NumFits + 1;
         end
 
