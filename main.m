@@ -24,6 +24,11 @@ function results = main(options)
 %   Name-value options:
 %       NumNodes, NumWolves, MaxIterations, NumProposals, EvalFraction,
 %       StagnationLimit, Seed, RunBaseline, Verbose
+%       IterationCallback  @(progress) called after every iteration of both
+%                          runs; progress has fields run ("hybrid" or
+%                          "baseline"), iteration, alpha_fitness,
+%                          alpha_position, rmse, diversity, evaluations.
+%                          simulate.m uses it for live plotting.
 %
 %   Requires the Statistics and Machine Learning Toolbox (fitrgp).
 
@@ -37,10 +42,11 @@ function results = main(options)
         options.Seed (1,1) double = 42
         options.RunBaseline (1,1) logical = true
         options.Verbose (1,1) logical = true
+        options.IterationCallback = []
     end
 
     project_root = fileparts(mfilename('fullpath'));
-    addpath(project_root);
+    addpath(project_root, fullfile(project_root, 'utils'));
 
     env = network.NetworkEnv('NumNodes', options.NumNodes);
     objective_fn = @(X) env.evaluatePopulation(X);
@@ -58,13 +64,26 @@ function results = main(options)
 
     results = struct('env', env, 'hybrid', hybrid, 'baseline', baseline, 'options', options);
 
-    if options.Verbose
-        fprintf('\nHybrid SMAC-GWO : best fitness %.5f using %d evaluations\n', ...
-            hybrid.best_fitness, hybrid.num_evaluations);
-        if options.RunBaseline
-            fprintf('Plain GWO       : best fitness %.5f using %d evaluations\n', ...
-                baseline.best_fitness, baseline.num_evaluations);
-        end
+    summary = LogManager("Summary", 'Enabled', options.Verbose);
+    summary.info('Hybrid SMAC-GWO : best fitness %.5f using %d evaluations', ...
+        hybrid.best_fitness, hybrid.num_evaluations);
+    if options.RunBaseline
+        summary.info('Plain GWO       : best fitness %.5f using %d evaluations', ...
+            baseline.best_fitness, baseline.num_evaluations);
+    end
+end
+
+% ======================================================================
+%  Progress reporting shared by both loops
+% ======================================================================
+function report(run_name, iter, engine, rmse, logger, options)
+    logger.iteration(iter, engine.AlphaFitness, rmse, engine.diversityIndex(), engine.NumEvaluations);
+    if ~isempty(options.IterationCallback)
+        progress = struct('run', run_name, 'iteration', iter, ...
+            'alpha_fitness', engine.AlphaFitness, 'alpha_position', engine.AlphaPosition, ...
+            'rmse', rmse, 'diversity', engine.diversityIndex(), ...
+            'evaluations', engine.NumEvaluations);
+        options.IterationCallback(progress);
     end
 end
 
@@ -80,11 +99,15 @@ function result = runHybrid(env, objective_fn, options)
     surrogate = optimizer.SMACSurrogate(env.lowerBounds(), env.upperBounds(), ...
         'Acquisition', "EI");
 
+    logger = LogManager("Hybrid SMAC-GWO", 'Enabled', options.Verbose);
+    logger.header();
+
     % Initial pack is evaluated for real: it seeds both GWO and the GP.
     positions = engine.initializePack();
     fitness = objective_fn(positions);
     engine.receiveFitness(positions, fitness);
     surrogate.addObservations(positions, fitness);
+    report("hybrid", 0, engine, NaN, logger, options);
 
     rmse_history = nan(options.MaxIterations, 1);
     eval_history = nan(options.MaxIterations + 1, 1);
@@ -123,6 +146,8 @@ function result = runHybrid(env, objective_fn, options)
                 uncertain = uncertain(~is_evaluated(uncertain));
                 is_evaluated(uncertain(1:min(num_real, numel(uncertain)))) = true;
                 stall_count = 0;
+                logger.info('Stagnation at iteration %d: also evaluating the %d most uncertain wolves', ...
+                    iter, nnz(is_evaluated) - num_real);
             end
 
             fitness = predicted_mu;
@@ -136,6 +161,7 @@ function result = runHybrid(env, objective_fn, options)
         surrogate.addObservations(candidates(is_evaluated, :), fitness(is_evaluated));
         engine.receiveFitness(candidates, fitness, is_evaluated);
         eval_history(iter + 1) = engine.NumEvaluations;
+        report("hybrid", iter, engine, rmse_history(iter), logger, options);
 
         if engine.AlphaFitness < previous_alpha
             stall_count = 0;
@@ -144,6 +170,7 @@ function result = runHybrid(env, objective_fn, options)
         end
     end
 
+    logger.footer();
     result = engine.getResult();
     result.evaluations = eval_history;
     result.surrogate_rmse = rmse_history;
@@ -159,6 +186,20 @@ function result = runBaseline(env, objective_fn, options, evaluation_budget)
 
     engine = optimizer.GWOEngine(env.lowerBounds(), env.upperBounds(), ...
         'NumWolves', num_wolves, 'MaxIterations', num_iterations);
-    result = engine.run(objective_fn);
+    logger = LogManager("Plain GWO baseline", 'Enabled', options.Verbose);
+    logger.header();
+
+    % Same steps as GWOEngine.run(), unrolled so progress can be reported.
+    positions = engine.initializePack();
+    engine.receiveFitness(positions, objective_fn(positions));
+    report("baseline", 0, engine, NaN, logger, options);
+    for iter = 1:num_iterations
+        candidates = engine.proposeCandidates();
+        engine.receiveFitness(candidates, objective_fn(candidates));
+        report("baseline", iter, engine, NaN, logger, options);
+    end
+
+    logger.footer();
+    result = engine.getResult();
     result.evaluations = num_wolves * (1:numel(result.history))';
 end
