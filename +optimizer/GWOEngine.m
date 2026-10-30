@@ -16,8 +16,8 @@ classdef GWOEngine < handle
     %   early on (wolves spread out, explore) and |A| < 1 later (wolves
     %   close in on the prey, exploit).
     %
-    %   The engine is split into small steps so a surrogate can sit between
-    %   them in a later commit:
+    %   The engine is split into small steps so the caller controls when
+    %   and how candidates are evaluated:
     %       initializePack()           -> random starting positions
     %       proposeCandidates()        -> next positions, nothing evaluated
     %       receiveFitness(pos, fit)   -> accept positions, update leaders
@@ -96,34 +96,24 @@ classdef GWOEngine < handle
             a = obj.ControlParameterStart * max(1 - progress, 0);
         end
 
-        function candidates = proposeCandidates(obj, num_proposals)
+        function candidates = proposeCandidates(obj)
             %PROPOSECANDIDATES  Encircling + hunting update for the whole pack.
             %   Returns the next positions without evaluating them. Fully
             %   vectorised over wolves and dimensions.
-            %
-            %   With num_proposals = K > 1, K independent random draws are
-            %   made for every wolf and stacked as K blocks of NumWolves rows:
-            %   row (k-1)*NumWolves + i is proposal k of wolf i. A surrogate
-            %   can then pick one proposal per wolf. Counts as one iteration.
-            arguments
-                obj
-                num_proposals (1,1) double {mustBeInteger, mustBePositive} = 1
-            end
             assert(isfinite(obj.AlphaFitness), 'GWOEngine:noLeaders', ...
                 'Call receiveFitness() on the initial pack before proposing.');
 
             a = obj.controlParameter();
             leader_positions = [obj.AlphaPosition; obj.BetaPosition; obj.DeltaPosition];
             num_leaders = size(leader_positions, 1);
-            size_pack = [obj.NumWolves * num_proposals, obj.Dimension];
-            current_positions = repmat(obj.WolfPositions, num_proposals, 1);
+            size_pack = [obj.NumWolves, obj.Dimension];
 
             suggested_sum = zeros(size_pack);
             for k = 1:num_leaders
                 leader_pos = leader_positions(k, :);
                 A = 2 * a * rand(size_pack) - a;                          % |A|>1 explore, |A|<1 exploit
                 C = 2 * rand(size_pack);                                  % random emphasis on the leader
-                distance_to_leader = abs(C .* leader_pos - current_positions);
+                distance_to_leader = abs(C .* leader_pos - obj.WolfPositions);
                 suggested_sum = suggested_sum + (leader_pos - A .* distance_to_leader);
             end
 
@@ -134,32 +124,18 @@ classdef GWOEngine < handle
             obj.Iteration = obj.Iteration + 1;
         end
 
-        function receiveFitness(obj, positions, fitness, is_evaluated)
+        function receiveFitness(obj, positions, fitness)
             %RECEIVEFITNESS  Accept an evaluated pack and refresh the leaders.
-            %   is_evaluated (optional, NumWolves x 1 logical) marks which
-            %   fitness values come from the real objective. The others are
-            %   surrogate predictions: those wolves still move, but they can
-            %   never become alpha/beta/delta and are not counted as
-            %   evaluations. Default: every value is real.
-            arguments
-                obj
-                positions double
-                fitness double
-                is_evaluated logical = true(size(positions, 1), 1)
-            end
             fitness = fitness(:);
-            is_evaluated = is_evaluated(:);
             assert(isequal(size(positions), [obj.NumWolves, obj.Dimension]) && ...
                    numel(fitness) == obj.NumWolves, 'GWOEngine:badInput', ...
                    'Expected %d x %d positions and %d fitness values.', ...
                    obj.NumWolves, obj.Dimension, obj.NumWolves);
-            assert(numel(is_evaluated) == obj.NumWolves, 'GWOEngine:badInput', ...
-                   'is_evaluated must have %d entries.', obj.NumWolves);
 
             obj.WolfPositions = positions;
             obj.WolfFitness = fitness;
-            obj.NumEvaluations = obj.NumEvaluations + nnz(is_evaluated);
-            obj.updateLeaders(is_evaluated);
+            obj.NumEvaluations = obj.NumEvaluations + obj.NumWolves;
+            obj.updateLeaders();
 
             obj.HistoryCount = obj.HistoryCount + 1;
             obj.BestFitnessHistory(obj.HistoryCount) = obj.AlphaFitness;
@@ -199,15 +175,12 @@ classdef GWOEngine < handle
     end
 
     methods (Access = private)
-        function updateLeaders(obj, is_evaluated)
+        function updateLeaders(obj)
             %UPDATELEADERS  Pick alpha/beta/delta from old leaders + current pack.
             %   Pooling the old leaders with the new pack is what makes the
-            %   leaders elitist (a good position is never forgotten). Only
-            %   really evaluated wolves are allowed into the pool.
-            pool_positions = [obj.AlphaPosition; obj.BetaPosition; obj.DeltaPosition; ...
-                              obj.WolfPositions(is_evaluated, :)];
-            pool_fitness = [obj.AlphaFitness; obj.BetaFitness; obj.DeltaFitness; ...
-                            obj.WolfFitness(is_evaluated)];
+            %   leaders elitist (a good position is never forgotten).
+            pool_positions = [obj.AlphaPosition; obj.BetaPosition; obj.DeltaPosition; obj.WolfPositions];
+            pool_fitness = [obj.AlphaFitness; obj.BetaFitness; obj.DeltaFitness; obj.WolfFitness];
 
             [~, order] = sort(pool_fitness, 'ascend');
             best_three = order(1:3);
