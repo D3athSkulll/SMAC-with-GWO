@@ -1,46 +1,35 @@
 function results = main(options)
-%MAIN  Hybrid SMAC-GWO optimisation of a wireless sensor network layout.
+%MAIN  Tune S-MAC (Sensor-MAC) parameters with the Grey Wolf Optimizer.
 %
-%   results = main() runs the hybrid optimiser and a plain GWO baseline
-%   on the same network problem and returns both runs.
+%   results = main() builds a fixed wireless sensor network, then lets GWO
+%   search the S-MAC settings that balance energy, delay and delivery:
 %
-%   Each hybrid iteration works like this:
-%     1. GWO proposes NumProposals candidate moves for every wolf
-%        (encircling/hunting equations, nothing evaluated yet).
-%     2. The SMAC surrogate (GP + Expected Improvement) scores every
-%        candidate; each wolf keeps its highest-scoring proposal.
-%     3. Only the EvalFraction most promising wolves are sent to the
-%        expensive network simulation. The others move using the GP's
-%        predicted fitness, but cannot become alpha/beta/delta.
-%     4. The surrogate is validated on the new real evaluations
-%        (out-of-sample RMSE) and then refitted with them.
-%     5. If alpha has not improved for StagnationLimit iterations, the
-%        least-certain candidates (highest sigma) are also evaluated, which
-%        pushes the pack out of a local minimum.
+%       x = [duty_cycle, frame_length, contention_window, sync_period]
 %
-%   The baseline gets the SAME budget of real evaluations, so the two
-%   convergence curves can be compared against evaluations spent.
+%   Every candidate x is scored by running the S-MAC simulator
+%   (network.SMACProtocol) on the same nodes, routes and traffic.
+%
+%   Two baselines put the result in context:
+%     * Default S-MAC  - the usual fixed setting (10% duty cycle, 1 s frame,
+%                        CW 32, SYNC every 10 frames), no optimisation.
+%     * Random search  - uniform random settings with the SAME number of
+%                        simulations as GWO. GWO must beat this to show the
+%                        hunting strategy helps, not just the budget.
 %
 %   Name-value options:
-%       NumNodes, NumWolves, MaxIterations, NumProposals, EvalFraction,
-%       StagnationLimit, Seed, RunBaseline, Verbose
+%       NumNodes, NumWolves, MaxIterations, Seed, RunBaselines, Verbose
 %       IterationCallback  @(progress) called after every iteration of both
-%                          runs; progress has fields run ("hybrid" or
-%                          "baseline"), iteration, alpha_fitness,
-%                          alpha_position, rmse, diversity, evaluations.
-%                          simulate.m uses it for live plotting.
-%
-%   Requires the Statistics and Machine Learning Toolbox (fitrgp).
+%                          searches; progress has fields run ("gwo" or
+%                          "random"), iteration, best_fitness, best_position,
+%                          diversity, evaluations. simulate.m uses it for
+%                          live plotting.
 
     arguments
         options.NumNodes (1,1) double {mustBeInteger, mustBePositive} = 20
         options.NumWolves (1,1) double {mustBeInteger, mustBePositive} = 30
-        options.MaxIterations (1,1) double {mustBeInteger, mustBePositive} = 60
-        options.NumProposals (1,1) double {mustBeInteger, mustBePositive} = 8
-        options.EvalFraction (1,1) double {mustBeInRange(options.EvalFraction, 0, 1, 'exclude-lower')} = 0.3
-        options.StagnationLimit (1,1) double {mustBeInteger, mustBePositive} = 5
+        options.MaxIterations (1,1) double {mustBeInteger, mustBePositive} = 40
         options.Seed (1,1) double = 42
-        options.RunBaseline (1,1) logical = true
+        options.RunBaselines (1,1) logical = true
         options.Verbose (1,1) logical = true
         options.IterationCallback = []
     end
@@ -49,157 +38,122 @@ function results = main(options)
     addpath(project_root, fullfile(project_root, 'utils'));
 
     env = network.NetworkEnv('NumNodes', options.NumNodes);
-    objective_fn = @(X) env.evaluatePopulation(X);
+    mac = network.SMACProtocol(env);
+    objective_fn = @(X) mac.evaluatePopulation(X);
 
-    % --- Hybrid SMAC-GWO ---
+    % --- GWO-tuned S-MAC ---
     rng(options.Seed);
-    hybrid = runHybrid(env, objective_fn, options);
+    gwo = runGWO(mac, objective_fn, options);
 
-    % --- Baseline: plain GWO with the same real-evaluation budget ---
-    baseline = struct();
-    if options.RunBaseline
+    % --- Baselines ---
+    default_run = struct();
+    random_run = struct();
+    if options.RunBaselines
+        [default_run.fitness, default_run.metrics] = mac.evaluate(mac.defaultParameters());
+        default_run.position = mac.defaultParameters();
         rng(options.Seed);
-        baseline = runBaseline(env, objective_fn, options, hybrid.num_evaluations);
+        random_run = runRandomSearch(mac, objective_fn, options, gwo.num_evaluations);
     end
 
-    results = struct('env', env, 'hybrid', hybrid, 'baseline', baseline, 'options', options);
+    results = struct('env', env, 'mac', mac, 'gwo', gwo, 'random_search', random_run, ...
+                     'default', default_run, 'options', options);
 
     summary = LogManager("Summary", 'Enabled', options.Verbose);
-    summary.info('Hybrid SMAC-GWO : best fitness %.5f using %d evaluations', ...
-        hybrid.best_fitness, hybrid.num_evaluations);
-    if options.RunBaseline
-        summary.info('Plain GWO       : best fitness %.5f using %d evaluations', ...
-            baseline.best_fitness, baseline.num_evaluations);
+    summary.info('GWO-tuned S-MAC : fitness %.4f | %s', gwo.best_fitness, describe(gwo.best_metrics));
+    if options.RunBaselines
+        summary.info('Random search   : fitness %.4f | %s', random_run.best_fitness, describe(random_run.best_metrics));
+        summary.info('Default S-MAC   : fitness %.4f | %s', default_run.fitness, describe(default_run.metrics));
     end
 end
 
 % ======================================================================
-%  Progress reporting shared by both loops
+%  GWO loop
 % ======================================================================
-function report(run_name, iter, engine, rmse, logger, options)
-    logger.iteration(iter, engine.AlphaFitness, rmse, engine.diversityIndex(), engine.NumEvaluations);
+function result = runGWO(mac, objective_fn, options)
+    engine = optimizer.GWOEngine(mac.lowerBounds(), mac.upperBounds(), ...
+        'NumWolves', options.NumWolves, 'MaxIterations', options.MaxIterations);
+    logger = newLogger("GWO-tuned S-MAC", options);
+    logger.header();
+
+    % Hunt: evaluate the pack, update alpha/beta/delta, move, repeat.
+    positions = engine.initializePack();
+    engine.receiveFitness(positions, objective_fn(positions));
+    report("gwo", 0, engine.AlphaPosition, engine.AlphaFitness, engine.diversityIndex(), ...
+           engine.NumEvaluations, mac, logger, options);
+    for iter = 1:options.MaxIterations
+        candidates = engine.proposeCandidates();
+        engine.receiveFitness(candidates, objective_fn(candidates));
+        report("gwo", iter, engine.AlphaPosition, engine.AlphaFitness, engine.diversityIndex(), ...
+               engine.NumEvaluations, mac, logger, options);
+    end
+    logger.footer();
+
+    result = engine.getResult();
+    result.evaluations = options.NumWolves * (1:numel(result.history))';
+    [~, result.best_metrics] = mac.evaluate(result.best_position);
+end
+
+% ======================================================================
+%  Random-search baseline (same evaluation budget)
+% ======================================================================
+function result = runRandomSearch(mac, objective_fn, options, evaluation_budget)
+    lb = mac.lowerBounds();
+    ub = mac.upperBounds();
+    batch_size = options.NumWolves;
+    num_batches = ceil(evaluation_budget / batch_size);
+    logger = newLogger("Random search baseline", options);
+    logger.header();
+
+    best_fitness = Inf;
+    best_position = nan(1, numel(lb));
+    history = zeros(num_batches, 1);
+    for batch = 1:num_batches
+        samples = lb + rand(batch_size, numel(lb)) .* (ub - lb);
+        fitness = objective_fn(samples);
+        [batch_best, idx] = min(fitness);
+        if batch_best < best_fitness
+            best_fitness = batch_best;
+            best_position = samples(idx, :);
+        end
+        history(batch) = best_fitness;
+        report("random", batch - 1, best_position, best_fitness, NaN, batch * batch_size, ...
+               mac, logger, options);
+    end
+    logger.footer();
+
+    [~, best_metrics] = mac.evaluate(best_position);
+    result = struct('best_position', best_position, 'best_fitness', best_fitness, ...
+                    'history', history, 'evaluations', batch_size * (1:num_batches)', ...
+                    'num_evaluations', num_batches * batch_size, 'best_metrics', best_metrics);
+end
+
+% ======================================================================
+%  Logging and progress reporting shared by both searches
+% ======================================================================
+function logger = newLogger(title, options)
+    columns = struct( ...
+        'name',   {'Iteration', 'Best Fitness', 'Duty Cycle', 'Frame (s)', 'CW', 'SYNC', 'Diversity', 'Evals'}, ...
+        'width',  {9, 12, 10, 9, 4, 4, 9, 6}, ...
+        'format', {'%d', '%.5f', '%.1f%%', '%.3f', '%d', '%d', '%.4f', '%d'});
+    logger = LogManager(title, columns, 'Enabled', options.Verbose);
+end
+
+function report(run_name, iter, best_position, best_fitness, diversity, evaluations, mac, logger, options)
+    params = mac.decode(best_position);
+    logger.row({iter, best_fitness, 100 * params.duty_cycle, params.frame_length, ...
+                params.contention_window, params.sync_period, diversity, evaluations});
     if ~isempty(options.IterationCallback)
-        progress = struct('run', run_name, 'iteration', iter, ...
-            'alpha_fitness', engine.AlphaFitness, 'alpha_position', engine.AlphaPosition, ...
-            'rmse', rmse, 'diversity', engine.diversityIndex(), ...
-            'evaluations', engine.NumEvaluations);
+        progress = struct('run', run_name, 'iteration', iter, 'best_fitness', best_fitness, ...
+                          'best_position', best_position, 'diversity', diversity, ...
+                          'evaluations', evaluations);
         options.IterationCallback(progress);
     end
 end
 
-% ======================================================================
-%  Hybrid loop
-% ======================================================================
-function result = runHybrid(env, objective_fn, options)
-    num_wolves = options.NumWolves;
-    num_real = max(1, round(options.EvalFraction * num_wolves));   % real evaluations per iteration
-
-    engine = optimizer.GWOEngine(env.lowerBounds(), env.upperBounds(), ...
-        'NumWolves', num_wolves, 'MaxIterations', options.MaxIterations);
-    surrogate = optimizer.SMACSurrogate(env.lowerBounds(), env.upperBounds(), ...
-        'Acquisition', "EI");
-
-    logger = LogManager("Hybrid SMAC-GWO", 'Enabled', options.Verbose);
-    logger.header();
-
-    % Initial pack is evaluated for real: it seeds both GWO and the GP.
-    positions = engine.initializePack();
-    fitness = objective_fn(positions);
-    engine.receiveFitness(positions, fitness);
-    surrogate.addObservations(positions, fitness);
-    report("hybrid", 0, engine, NaN, logger, options);
-
-    rmse_history = nan(options.MaxIterations, 1);
-    eval_history = nan(options.MaxIterations + 1, 1);
-    eval_history(1) = engine.NumEvaluations;
-    stall_count = 0;
-
-    for iter = 1:options.MaxIterations
-        previous_alpha = engine.AlphaFitness;
-
-        % Step 1: several GWO moves per wolf, stacked in NumProposals blocks.
-        proposals = engine.proposeCandidates(options.NumProposals);
-
-        if ~surrogate.isReady()
-            % Not enough data for a GP yet: fall back to plain GWO.
-            candidates = proposals(1:num_wolves, :);
-            is_evaluated = true(num_wolves, 1);
-            fitness = objective_fn(candidates);
-        else
-            % Step 2: keep each wolf's best proposal according to the acquisition.
-            [~, info] = surrogate.screen(proposals, 1);
-            score = reshape(info.score, num_wolves, options.NumProposals);
-            [best_score, best_k] = max(score, [], 2);
-            pick = sub2ind([num_wolves, options.NumProposals], (1:num_wolves)', best_k);
-            candidates = proposals(pick, :);
-            predicted_mu = info.mu(pick);
-            predicted_sigma = info.sigma(pick);
-
-            % Step 3: send only the most promising wolves to the simulator.
-            [~, order] = sort(best_score, 'descend');
-            is_evaluated = false(num_wolves, 1);
-            is_evaluated(order(1:num_real)) = true;
-
-            % Step 5: on stagnation, also evaluate the most uncertain wolves.
-            if stall_count >= options.StagnationLimit
-                [~, uncertain] = sort(predicted_sigma, 'descend');
-                uncertain = uncertain(~is_evaluated(uncertain));
-                is_evaluated(uncertain(1:min(num_real, numel(uncertain)))) = true;
-                stall_count = 0;
-                logger.info('Stagnation at iteration %d: also evaluating the %d most uncertain wolves', ...
-                    iter, nnz(is_evaluated) - num_real);
-            end
-
-            fitness = predicted_mu;
-            fitness(is_evaluated) = objective_fn(candidates(is_evaluated, :));
-
-            % Step 4: out-of-sample check, then learn from the new data.
-            rmse_history(iter) = surrogate.validationRMSE( ...
-                candidates(is_evaluated, :), fitness(is_evaluated));
-        end
-
-        surrogate.addObservations(candidates(is_evaluated, :), fitness(is_evaluated));
-        engine.receiveFitness(candidates, fitness, is_evaluated);
-        eval_history(iter + 1) = engine.NumEvaluations;
-        report("hybrid", iter, engine, rmse_history(iter), logger, options);
-
-        if engine.AlphaFitness < previous_alpha
-            stall_count = 0;
-        else
-            stall_count = stall_count + 1;
-        end
-    end
-
-    logger.footer();
-    result = engine.getResult();
-    result.evaluations = eval_history;
-    result.surrogate_rmse = rmse_history;
-end
-
-% ======================================================================
-%  Baseline loop
-% ======================================================================
-function result = runBaseline(env, objective_fn, options, evaluation_budget)
-    % Plain GWO, with as many iterations as the hybrid's budget allows.
-    num_wolves = options.NumWolves;
-    num_iterations = max(1, floor(evaluation_budget / num_wolves) - 1);
-
-    engine = optimizer.GWOEngine(env.lowerBounds(), env.upperBounds(), ...
-        'NumWolves', num_wolves, 'MaxIterations', num_iterations);
-    logger = LogManager("Plain GWO baseline", 'Enabled', options.Verbose);
-    logger.header();
-
-    % Same steps as GWOEngine.run(), unrolled so progress can be reported.
-    positions = engine.initializePack();
-    engine.receiveFitness(positions, objective_fn(positions));
-    report("baseline", 0, engine, NaN, logger, options);
-    for iter = 1:num_iterations
-        candidates = engine.proposeCandidates();
-        engine.receiveFitness(candidates, objective_fn(candidates));
-        report("baseline", iter, engine, NaN, logger, options);
-    end
-
-    logger.footer();
-    result = engine.getResult();
-    result.evaluations = num_wolves * (1:numel(result.history))';
+function text = describe(metrics)
+    p = metrics.params;
+    text = sprintf(['duty %.1f%%, frame %.2f s, CW %d, SYNC %d -> PDR %.1f%%, delay %.2f s, ' ...
+                    'power %.2f mW, lifetime %.0f days'], 100 * p.duty_cycle, p.frame_length, ...
+                   p.contention_window, p.sync_period, 100 * metrics.pdr, metrics.mean_delay, ...
+                   1e3 * metrics.mean_power, metrics.lifetime_days);
 end

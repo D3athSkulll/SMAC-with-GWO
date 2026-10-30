@@ -43,14 +43,15 @@ assert(all(candidates >= lb, 'all') && all(candidates <= ub, 'all'), ...
 %% Test 7: diversity collapses as the pack converges
 assert(result.diversity(end) < result.diversity(1), 'Test 7 failed: diversity did not shrink');
 
-%% Test 8: GWO improves on the sensor network problem
-env = network.NetworkEnv('NumNodes', 20);
-engine = optimizer.GWOEngine(env.lowerBounds(), env.upperBounds(), ...
-                             'NumWolves', 20, 'MaxIterations', 30);
-result = engine.run(@(X) env.evaluatePopulation(X));
+%% Test 8: GWO improves S-MAC parameters on the sensor network
+mac = network.SMACProtocol(network.NetworkEnv('NumNodes', 20));
+engine = optimizer.GWOEngine(mac.lowerBounds(), mac.upperBounds(), ...
+                             'NumWolves', 10, 'MaxIterations', 10);
+result = engine.run(@(X) mac.evaluatePopulation(X));
 assert(result.best_fitness <= result.history(1), 'Test 8 failed: no improvement');
-[~, metrics] = env.evaluate(result.best_position);
-fprintf('Network GWO: fitness %.4f -> %.4f | coverage %.1f%% | connectivity %.0f%%\n', ...
-    result.history(1), result.best_fitness, 100 * metrics.coverage, 100 * metrics.connectivity);
+[~, metrics] = mac.evaluate(result.best_position);
+fprintf('S-MAC GWO: fitness %.4f -> %.4f | duty %.1f%% | frame %.2f s | PDR %.1f%%\n', ...
+    result.history(1), result.best_fitness, 100 * metrics.params.duty_cycle, ...
+    metrics.params.frame_length, 100 * metrics.pdr);
 
 disp('All GWOEngine tests passed.');

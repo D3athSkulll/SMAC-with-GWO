@@ -1,44 +1,47 @@
 classdef LogManager < handle
     %LOGMANAGER  Structured command-window logging for the optimisers.
     %
-    %   Prints one table row per iteration:
-    %       Iteration | Best Alpha Fitness | Surrogate RMSE | Diversity Index | Evals
-    %   plus timestamped info/warning lines. All output goes through
-    %   fprintf to a file id (1 = command window), so a log file can be
-    %   used instead.
+    %   Prints a fixed-width table, one row per iteration, plus timestamped
+    %   info/warning lines. The columns are defined by the caller as a struct
+    %   array with fields name, width and format (an sprintf format). NaN
+    %   values are shown as "-". All output goes through fprintf to a file id
+    %   (1 = command window), so a log file can be used instead.
     %
     %   Typical use:
-    %       log = LogManager('Hybrid SMAC-GWO');
-    %       log.header();
-    %       log.iteration(iter, alpha_fitness, rmse, diversity, evaluations);
-    %       log.footer();
+    %       columns = struct('name', {'Iteration', 'Best Fitness'}, ...
+    %                        'width', {9, 12}, 'format', {'%d', '%.5f'});
+    %       logger = LogManager("GWO", columns);
+    %       logger.header();
+    %       logger.row({iter, best_fitness});
+    %       logger.footer();
 
     properties (SetAccess = immutable)
         Title           % name shown above the table
+        Columns         % struct array: name, width, format
         FileId          % fprintf target, 1 = command window
         Enabled         % false silences every method
-        PrintEvery      % print one row every PrintEvery iterations
-    end
-
-    properties (Constant, Access = private)
-        ColumnWidths = [9 20 16 17 7]
-        ColumnNames = {'Iteration', 'Best Alpha Fitness', 'Surrogate RMSE', ...
-                       'Diversity Index', 'Evals'}
+        PrintEvery      % print every PrintEvery-th row (the first row is always printed)
     end
 
     properties (SetAccess = private)
         StartTime       % tic value taken by header()
+        RowCount = 0    % rows received since header()
     end
 
     methods
-        function obj = LogManager(title, options)
+        function obj = LogManager(title, columns, options)
             arguments
                 title (1,1) string = "Optimizer"
+                columns struct = struct('name', {'Iteration', 'Best Fitness'}, ...
+                                        'width', {9, 12}, 'format', {'%d', '%.6f'})
                 options.FileId (1,1) double = 1
                 options.Enabled (1,1) logical = true
                 options.PrintEvery (1,1) double {mustBeInteger, mustBePositive} = 1
             end
+            assert(all(isfield(columns, {'name', 'width', 'format'})), 'LogManager:badColumns', ...
+                'columns needs the fields name, width and format.');
             obj.Title = title;
+            obj.Columns = columns(:)';
             obj.FileId = options.FileId;
             obj.Enabled = options.Enabled;
             obj.PrintEvery = options.PrintEvery;
@@ -48,27 +51,31 @@ classdef LogManager < handle
         function header(obj)
             %HEADER  Title, column names and a separator line.
             obj.StartTime = tic;
+            obj.RowCount = 0;
             if ~obj.Enabled, return; end
             fprintf(obj.FileId, '\n== %s ==\n', obj.Title);
             obj.printRule();
-            cells = arrayfun(@(k) obj.pad(obj.ColumnNames{k}, obj.ColumnWidths(k)), ...
-                             1:numel(obj.ColumnWidths), 'UniformOutput', false);
+            cells = arrayfun(@(c) obj.pad(c.name, c.width, 'left'), obj.Columns, 'UniformOutput', false);
             fprintf(obj.FileId, '| %s |\n', strjoin(cells, ' | '));
             obj.printRule();
         end
 
-        function iteration(obj, iter, alpha_fitness, rmse, diversity, evaluations)
-            %ITERATION  One table row. NaN RMSE is shown as "-" (no model yet).
-            if ~obj.Enabled || mod(iter, obj.PrintEvery) ~= 0, return; end
-            if isnan(rmse)
-                rmse_text = '-';
-            else
-                rmse_text = sprintf('%.5f', rmse);
+        function row(obj, values)
+            %ROW  One table row; values is a cell with one entry per column.
+            assert(numel(values) == numel(obj.Columns), 'LogManager:badRow', ...
+                'Expected %d values, got %d.', numel(obj.Columns), numel(values));
+            obj.RowCount = obj.RowCount + 1;
+            if ~obj.Enabled || mod(obj.RowCount - 1, obj.PrintEvery) ~= 0, return; end
+            cells = cell(1, numel(values));
+            for k = 1:numel(values)
+                value = values{k};
+                if isnumeric(value) && isscalar(value) && isnan(value)
+                    text = '-';
+                else
+                    text = sprintf(obj.Columns(k).format, value);
+                end
+                cells{k} = obj.pad(text, obj.Columns(k).width, 'right');
             end
-            values = {sprintf('%d', iter), sprintf('%.6f', alpha_fitness), rmse_text, ...
-                      sprintf('%.4f', diversity), sprintf('%d', evaluations)};
-            cells = arrayfun(@(k) obj.pad(values{k}, obj.ColumnWidths(k), 'right'), ...
-                             1:numel(values), 'UniformOutput', false);
             fprintf(obj.FileId, '| %s |\n', strjoin(cells, ' | '));
         end
 
@@ -96,7 +103,7 @@ classdef LogManager < handle
         end
 
         function printRule(obj)
-            dashes = arrayfun(@(w) repmat('-', 1, w + 2), obj.ColumnWidths, 'UniformOutput', false);
+            dashes = arrayfun(@(c) repmat('-', 1, c.width + 2), obj.Columns, 'UniformOutput', false);
             fprintf(obj.FileId, '+%s+\n', strjoin(dashes, '+'));
         end
     end
@@ -104,7 +111,6 @@ classdef LogManager < handle
     methods (Static, Access = private)
         function text = pad(text, width, justify)
             %PAD  Fit text into a fixed-width column ('left' or 'right' justified).
-            if nargin < 3, justify = 'left'; end
             text = char(text);
             if numel(text) > width
                 text = text(1:width);
